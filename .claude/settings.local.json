@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl:*)",
+      "WebFetch(domain:docs.polymarket.com)",
+      "WebFetch(domain:gist.github.com)",
+      "Bash(python3:*)",
+      "Bash(source venv/bin/activate)",
+      "Bash(pip install:*)",
+      "Bash(python analyze_market.py:*)",
+      "Bash(python:*)",
+      "WebFetch(domain:polymarket.com)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "Bash(git init:*)",
+      "Bash(git add:*)"
+    ]
+  }
+}

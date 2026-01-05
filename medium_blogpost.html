@@ -1,0 +1,223 @@
+<h1 class="graf graf--h1">The $400K Maduro Trade: How I Built a Polymarket Anomaly Detection Tool</h1>
+<h2 class="graf graf--h2">The Future is a Market</h2>
+<p class="graf graf--p">Prediction markets represent one of humanity's most fascinating experiments in collective intelligence. The concept is elegantly simple: allow people to bet real money on future events, and the resulting prices reveal what the crowd truly believes will happen. Unlike polls or expert forecasts, prediction markets harness a powerful economic force—the opportunity to profit from others' biases.</p>
+<p class="graf graf--p">Here's the beautiful equilibrium at work: if a market says there's a 70% chance of an event, but you believe it's actually 90%, you can buy shares and profit when you're proven right. This financial incentive means that mispriced probabilities don't last long. Traders rush in to correct them, and the market price converges toward the actual probability. It's crowdsourced truth-finding with skin in the game.</p>
+<p class="graf graf--p">This mechanism recently captured international attention in January 2025 when the U.S. executed a covert operation to extract Venezuelan leader Nicolás Maduro. Within hours, headlines appeared across major outlets:</p>
+<ul class="postList graf graf--ul">
+<li class="graf graf--li"><em class="markup--em markup--p-em">"Someone made a huge profit predicting Maduro's capture. Here's what happened"</em></li>
+<li class="graf graf--li"><em class="markup--em markup--p-em">"Was Someone Insider Trading Right Before Trump's Attack on Venezuela?"</em> (<a href="https://newrepublic.com/post/204885/insider-trading-trump-attack-venezuela-maduro-polymarket">The New Republic</a>)</li>
+<li class="graf graf--li"><em class="markup--em markup--p-em">"Suspicious bets on Maduro's removal raise eyebrows as user nets over US$400,000"</em></li>
+</ul>
+<p class="graf graf--p">One trader had made over $400,000 betting on Maduro's removal—apparently knowing something the market didn't. The trading pattern was striking: large positions entered days before the operation became public, at prices suggesting only a 7-15% probability of success.</p>
+<p class="graf graf--p">Reading these headlines, I was fascinated: <strong class="markup--strong markup--p-strong">How can we analyze these phenomena systematically? Can we build tools to detect unusual trading patterns and study information asymmetry in prediction markets?</strong></p>
+<h2 class="graf graf--h2">The Problem: Polymarket's Limited Data Access</h2>
+<p class="graf graf--p">Polymarket's website offers impressive statistics—global leaderboards, category leaders, and market-level data. You can see who won the most on "Politics" this week. But there's a critical gap: <strong class="markup--strong markup--p-strong">you can't see a leaderboard for a specific market question.</strong></p>
+<p class="graf graf--p">Who were the top 10 traders on "Maduro out by January 31, 2026?" What were their average entry prices? How much did they stake? This granular, market-specific analysis isn't available on the platform.</p>
+<p class="graf graf--p">Fortunately, Polymarket has a public API. Time to build something custom.</p>
+<h2 class="graf graf--h2">The API Challenge: The 1,000 Trade Wall</h2>
+<p class="graf graf--p">According to the official Polymarket API documentation, the <code class="markup--code markup--pre-code">/trades</code> endpoint should support offset values up to 10,000. In theory, you could paginate through 10,000+ trades per market. In practice? <strong class="markup--strong markup--p-strong">The API hits a hard limit around offset=1,000.</strong></p>
+<p class="graf graf--p">Here's what happens when you try to fetch beyond that limit:</p>
+<pre class="graf graf--pre"><code class="markup--code markup--pre-code">def fetch_all_trades(condition_id: str):
+    """Attempt to fetch all trades - hits the 1000 offset wall"""
+    base_url = "https://data-api.polymarket.com/trades"
+    all_trades = []
+    offset = 0
+    limit = 500
+
+    while offset &lt; 10000:
+        params = {
+            "market": condition_id,
+            "limit": limit,
+            "offset": offset
+        }
+
+        response = requests.get(base_url, params=params)
+        trades = response.json()
+
+        if not trades:
+            break
+
+        all_trades.extend(trades)
+        offset += limit
+
+    return all_trades
+</code></pre>
+<p class="graf graf--p">Testing revealed that once offset exceeds ~1,000, the API returns duplicate data. You're stuck with roughly 1,500 unique trades—not nearly enough for comprehensive market analysis.</p>
+<h2 class="graf graf--h2">The Solution: Filter by Trade Size</h2>
+<p class="graf graf--p">The breakthrough came from discovering two undocumented(?) parameters: <code class="markup--code markup--pre-code">filterType</code> and <code class="markup--code markup--pre-code">filterAmount</code>. These let you filter trades by cash value:</p>
+<pre class="graf graf--pre"><code class="markup--code markup--pre-code">def fetch_big_trades(condition_id: str, min_cash: int = 1000):
+    """Fetch only trades above a certain dollar value"""
+    base_url = "https://data-api.polymarket.com/trades"
+    all_trades = []
+    seen_hashes = set()  # Deduplication
+    offset = 0
+    limit = 500
+
+    while offset &lt; 10000:
+        params = {
+            "market": condition_id,
+            "limit": limit,
+            "offset": offset,
+            "filterType": "CASH",      # Filter by cash value
+            "filterAmount": min_cash    # Minimum trade value
+        }
+
+        response = requests.get(base_url, params=params)
+        trades = response.json()
+
+        if not trades:
+            break
+
+        # Deduplicate using transaction hash
+        new_trades = []
+        for trade in trades:
+            tx_hash = trade.get('transactionHash')
+            if tx_hash and tx_hash not in seen_hashes:
+                seen_hashes.add(tx_hash)
+                new_trades.append(trade)
+
+        if not new_trades:  # All duplicates? We've hit the end
+            break
+
+        all_trades.extend(new_trades)
+        offset += limit
+
+    return all_trades
+</code></pre>
+<p class="graf graf--p">With a $1,000 minimum trade filter, I suddenly had access to <strong class="markup--strong markup--p-strong">13.5 days of trading history</strong> instead of just 2-3 hours. The "big money" traders—the ones who likely have conviction and information—became visible.</p>
+<h2 class="graf graf--h2">Building the Leaderboard</h2>
+<p class="graf graf--p">The next challenge: calculating profit and loss (P&amp;L) for each trader. Polymarket markets are binary—each share pays $1 if your outcome wins, $0 if it loses. Traders can BUY shares (going long) or SELL shares (going short).</p>
+<p class="graf graf--p">Here's the P&amp;L calculation:</p>
+<pre class="graf graf--pre"><code class="markup--code markup--pre-code">def calculate_leaderboard(trades, resolves_to="Yes"):
+    """Calculate P&amp;L for each trader"""
+    from collections import defaultdict
+
+    user_trades = defaultdict(list)
+    for trade in trades:
+        wallet = trade['proxyWallet']
+        user_trades[wallet].append(trade)
+
+    results = []
+
+    for wallet, user_trade_list in user_trades.items():
+        yes_shares = 0
+        no_shares = 0
+        total_spent = 0
+        total_received = 0
+
+        for trade in user_trade_list:
+            size = trade['size']
+            price = trade['price']
+            side = trade['side']
+            outcome = trade['outcome']
+
+            if side == 'BUY':
+                cost = size * price
+                total_spent += cost
+                if outcome == 'Yes':
+                    yes_shares += size
+                else:
+                    no_shares += size
+            else:  # SELL
+                revenue = size * price
+                total_received += revenue
+                if outcome == 'Yes':
+                    yes_shares -= size
+                else:
+                    no_shares -= size
+
+        # Calculate final position value
+        if resolves_to == 'Yes':
+            final_value = yes_shares  # $1 per share
+        else:
+            final_value = no_shares
+
+        # P&amp;L = Final position value - money spent + money received
+        pnl = final_value - total_spent + total_received
+
+        results.append({
+            'wallet': wallet,
+            'pnl': pnl,
+            'total_spent': total_spent,
+            'total_received': total_received,
+            'final_shares': final_value
+        })
+
+    results.sort(key=lambda x: x['pnl'], reverse=True)
+    return results
+</code></pre>
+<p class="graf graf--p"><strong class="markup--strong markup--p-strong">Critical insight:</strong> Negative shares represent a short position (a liability), not a zero value. Early versions of my code capped negative shares at zero, which incorrectly showed massive profits for traders with large short positions. The market is zero-sum—all gains equal all losses (minus fees).</p>
+<h2 class="graf graf--h2">Detecting Market Resolution</h2>
+<p class="graf graf--p">The final piece: automatically detecting which outcome won. Polymarket returns an <code class="markup--code markup--pre-code">outcomePrices</code> field that shows final prices:</p>
+<pre class="graf graf--pre"><code class="markup--code markup--pre-code"># Parse market data
+market_data = get_market_data(condition_id)
+outcome_prices_raw = market_data.get('outcomePrices', [])
+
+# API returns JSON string, need to parse
+import json
+outcome_prices = json.loads(outcome_prices_raw) if isinstance(outcome_prices_raw, str) else outcome_prices_raw
+
+# ["1", "0"] means first outcome won
+# ["0", "1"] means second outcome won
+if outcome_prices[0] == "1":
+    resolution = "Yes"
+elif outcome_prices[1] == "1":
+    resolution = "No"
+</code></pre>
+<p class="graf graf--p">With resolution detection in place, the leaderboard automatically shows the real winners—no guessing required.</p>
+<h2 class="graf graf--h2">The Streamlit Dashboard</h2>
+<p class="graf graf--p">I wrapped everything in a Streamlit web app that lets you:</p>
+<ul class="postList graf graf--ul">
+<li class="graf graf--li"><strong class="markup--strong markup--p-strong">Search markets by name</strong> (e.g., "Maduro", "Trump", "Venezuela")</li>
+<li class="graf graf--li"><strong class="markup--strong markup--p-strong">Set minimum trade values</strong> (focus on whales or include small traders)</li>
+<li class="graf graf--li"><strong class="markup--strong markup--p-strong">View multiple leaderboards</strong>: by P&amp;L, by amount spent, and sample trades</li>
+<li class="graf graf--li"><strong class="markup--strong markup--p-strong">Auto-detect resolution</strong> with manual override option</li>
+<li class="graf graf--li"><strong class="markup--strong markup--p-strong">Link directly to trader profiles</strong> on Polymarket</li>
+</ul>
+<p class="graf graf--p">The full source code is available on GitHub: <a href="https://github.com/yourusername/PolymarketAnalyzer">PolymarketAnalyzer</a> <em class="markup--em markup--p-em">(update with your actual link)</em></p>
+<h2 class="graf graf--h2">The Maduro Market: A $400K Winner</h2>
+<p class="graf graf--p">Running the analyzer on "Maduro out by January 31, 2026?" revealed the suspected insider trader. This individual:</p>
+<ul class="postList graf graf--ul">
+<li class="graf graf--li">Made over <strong class="markup--strong markup--p-strong">$400,000 profit</strong></li>
+<li class="graf graf--li">Spent only ~$32,000 (buying at average price of $0.07)</li>
+<li class="graf graf--li">Appeared on Polymarket's global Politics leaderboard for the week</li>
+<li class="graf graf--li">Entered positions <strong class="markup--strong markup--p-strong">days before</strong> the U.S. operation became public</li>
+</ul>
+<p class="graf graf--p">The timing is striking. While the rest of the market priced Maduro's removal at 7-15% probability, someone was quietly accumulating massive positions. Either extraordinary conviction or extraordinary information.</p>
+<h2 class="graf graf--h2">Prediction Markets as Truth Machines</h2>
+<p class="graf graf--p">This investigation reveals something profound about prediction markets. Despite occasional disputes over resolution criteria, <strong class="markup--strong markup--p-strong">there's often more consensus on betting outcomes than on Wikipedia articles or "fact-checks."</strong></p>
+<p class="graf graf--p">When money is at stake, people become remarkably careful about truth. Biased or incorrect beliefs cost you. Accurate beliefs pay you. Over time, this creates a form of truth-finding that transcends political tribalism.</p>
+<p class="graf graf--p">Could we leverage this property to battle disinformation? Imagine prediction markets for disputed factual claims:</p>
+<ul class="postList graf graf--ul">
+<li class="graf graf--li">"COVID-19 originated from a lab leak" (resolves based on future evidence)</li>
+<li class="graf graf--li">"Crime rates increased in City X in 2024" (resolves based on official statistics)</li>
+<li class="graf graf--li">"Candidate Y's policy will reduce inflation" (resolves based on economic data)</li>
+</ul>
+<p class="graf graf--p">The market prices wouldn't be perfect, but they might be more reliable than social media consensus or partisan news coverage.</p>
+<p class="graf graf--p"><strong class="markup--strong markup--p-strong">If you have ideas about using prediction markets to differentiate truth from falsehood, please reach out.</strong> I'm genuinely curious whether this tool could help combat disinformation at scale.</p>
+<h2 class="graf graf--h2">Building with Claude Code</h2>
+<p class="graf graf--p">A brief note on the development process: I built this entire analyzer in a few hours using <strong class="markup--strong markup--p-strong">Claude Code</strong>, Anthropic's AI-powered coding CLI. The experience was remarkable.</p>
+<p class="graf graf--p">Claude Code can:</p>
+<ul class="postList graf graf--ul">
+<li class="graf graf--li"><strong class="markup--strong markup--p-strong">Access the internet</strong> to fetch API documentation</li>
+<li class="graf graf--li"><strong class="markup--strong markup--p-strong">Make live API calls</strong> to test endpoints</li>
+<li class="graf graf--li"><strong class="markup--strong markup--p-strong">Iterate rapidly</strong> on bugs and edge cases</li>
+<li class="graf graf--li"><strong class="markup--strong markup--p-strong">Write and refactor</strong> across multiple files</li>
+</ul>
+<p class="graf graf--p">The back-and-forth felt like pair programming with an expert who never gets tired. "The offset limit isn't working—add deduplication." Done in 30 seconds. "Parse the JSON string for outcomePrices." Fixed immediately. "Add automatic resolution detection." Implemented with tests.</p>
+<p class="graf graf--p">For exploratory projects like this—where you're reverse-engineering an API, discovering edge cases, and building a UI—Claude Code shines. Highly recommended for rapid prototyping.</p>
+<h2 class="graf graf--h2">Conclusion: Skin in the Game Creates Signal</h2>
+<p class="graf graf--p">Prediction markets work because they force people to put their money where their mouth is. Empty speculation becomes costly. Genuine insight becomes profitable. The result is a price signal that aggregates information from thousands of participants, weighted by confidence and capital.</p>
+<p class="graf graf--p">The Maduro market demonstrates both the power and the peril of this system. Someone with privileged information made a fortune. But that same fortune serves as a red flag—a public signal that something unusual happened. Researchers, journalists, and regulators can investigate.</p>
+<p class="graf graf--p">As prediction markets grow, tools like this leaderboard analyzer become essential. <strong class="markup--strong markup--p-strong">Who's betting on what? When did they enter? What do unusual patterns suggest?</strong></p>
+<p class="graf graf--p">The future is being priced right now. Let's build better tools to read those signals.</p>
+<hr>
+<p class="graf graf--p"><em class="markup--em markup--p-em">Interested in prediction markets, trading analysis, or building with Claude Code? Connect with me on [Twitter/LinkedIn] or drop a comment below.</em></p>
+<hr>
+<p class="graf graf--p"><strong class="markup--strong markup--p-strong">Code and Resources:</strong></p>
+<ul class="postList graf graf--ul">
+<li class="graf graf--li">GitHub Repository: <a href="https://github.com/yourusername/PolymarketAnalyzer">PolymarketAnalyzer</a></li>
+<li class="graf graf--li">Polymarket API: <a href="https://docs.polymarket.com">https://docs.polymarket.com</a></li>
+<li class="graf graf--li">Streamlit Documentation: <a href="https://docs.streamlit.io">https://docs.streamlit.io</a></li>
+<li class="graf graf--li">Claude Code: <a href="https://claude.com/claude-code">https://claude.com/claude-code</a></li>
+</ul>
