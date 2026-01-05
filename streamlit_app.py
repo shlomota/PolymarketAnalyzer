@@ -204,7 +204,7 @@ def get_profile_url(wallet: str, timestamp: int = None):
 def main():
     st.set_page_config(
         page_title="Polymarket Leaderboard",
-        page_icon="polymarket_logo.png",
+        page_icon="images/polymarket_logo.png",
         layout="wide"
     )
 
@@ -221,7 +221,7 @@ def main():
     # Header with logo
     col1, col2 = st.columns([1, 12])
     with col1:
-        st.image("polymarket_logo.png", width=80)
+        st.image("images/polymarket_logo.png", width=80)
     with col2:
         st.title("Polymarket Trading Leaderboard")
 
